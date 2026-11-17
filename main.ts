@@ -1,24 +1,31 @@
 // gta6-twitch-ccu-forecast-01 — launch-day Twitch viewer forecaster.
 //
-// Model: for each hour h = 2..24 the five quantiles are
+// Round-2 model: for each hour h = 2..24 the five quantiles are
 //     q_tau(h) = p1 * exp(mu_h + z_tau * sigma_h)
-// where p1 is hour 1's print, mu_h is the median log-ratio of hour h to
-// hour 1 across comparable past launches, sigma_h is the log-spread of
-// those ratios, and z_tau is the standard normal quantile at each level.
+// where p1 is hour 1's print. The launch-day shape is predictable from
+// launch scale (big launches stay flat or decline, small launches ramp
+// steeply; corr of log hour-1 with log ratio reaches about -0.8 late),
+// so mu_h is a per-hour OLS regression of the log-ratio
+// y = ln(v_h / v_1) on x = ln(p1) across the pool, mean-centred:
+//     mu_h = mean(y) + slope_h * (ln p1 - mean(x))
+// with no shrinkage and no clamping of ln p1 to the pool range —
+// extrapolation is what makes tiny (and huge) launches predictable.
+// sigma_h is the dispersion of the residuals around the fitted line,
+// median-centred for robustness:
+//     resid_i = y_i - (median(y) + slope_h * (x_i - median(x)))
+//     sigma_h = max(sample sd of resid, IQR(resid) / 1.349)
+// The mu and sigma curves are lightly smoothed across neighbouring
+// hours and sigma is floored from hour 6 on.
 //
 // mu_h and sigma_h are fitted at runtime from the case file's own
-// comparables: only launches that unlocked at midnight local time, whose
-// hour-1 print was already meaningful (>= 10,000 viewers, so some region
-// had unlocked by hour 1), and excluding the GTA VI pre-release category
-// history and any comparable launched on the case's own day (the latter
-// keeps leave-one-out validation honest). The median shape is conditioned
-// on launch scale: only pool members on the same side of the pool's
-// median hour-1 as this case set the median, while the spread always
-// comes from the full pool, so a halved pool cannot collapse the
-// quantiles. The fitted curves are lightly smoothed across neighbouring
-// hours and the spread is floored from hour 6 on. When the pool is too
-// small (< 5 launches) the program falls back to embedded constants
-// fitted the same way on the rolling-midnight big-launch pool.
+// comparables: only launches that unlocked at midnight local time,
+// whose hour-1 print was already meaningful (>= 10,000 viewers, so
+// some region had unlocked by hour 1), excluding the GTA VI
+// pre-release category history and any comparable launched on the
+// case's own day (the latter keeps leave-one-out validation honest).
+// When the pool is too small (< 5 launches) the program falls back to
+// embedded constants fitted the same way on the rolling-midnight
+// big-launch pool.
 //
 // Node 22, standard library only, no network, deterministic.
 
@@ -39,6 +46,9 @@ const HOURS = Array.from({ length: 23 }, (_, i) => i + 2); // 2..24
 // kept out by the midnight-local test (their hour 1 is pre-unlock).
 const MIN_HOUR1 = 10000;
 const MIN_POOL = 5;
+// An hour needs at least this many pool members with hour-h data to be
+// fitted directly; thinner hours are filled from fitted neighbours.
+const MIN_HOUR_MEMBERS = 3;
 // Spread floor from hour 6 onward: the cross-game dispersion stays wide
 // all day, so never let a lucky pool pretend otherwise.
 const SPREAD_FLOOR_LATE = 0.5;
@@ -85,6 +95,10 @@ function sortedCopy(xs: number[]): number[] {
   return [...xs].sort((a, b) => a - b);
 }
 
+function meanOf(xs: number[]): number {
+  return xs.reduce((a, b) => a + b, 0) / xs.length;
+}
+
 function quantileAt(xs: number[], p: number): number {
   const s = sortedCopy(xs);
   if (s.length === 0) return NaN;
@@ -95,11 +109,15 @@ function quantileAt(xs: number[], p: number): number {
   return s[lo] + (s[hi] - s[lo]) * (pos - lo);
 }
 
+function medianOf(xs: number[]): number {
+  return quantileAt(xs, 0.5);
+}
+
 function spreadOf(xs: number[]): number {
   // The larger of the sample std and an IQR-based robust sigma: with a
   // dozen pool members either alone can understate the true dispersion.
   if (xs.length < 2) return 0;
-  const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const m = meanOf(xs);
   const sd = Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
   const iqr = (quantileAt(xs, 0.75) - quantileAt(xs, 0.25)) / 1.349;
   return Math.max(sd, iqr);
@@ -140,14 +158,45 @@ function isGtaCategoryHistory(comp: Comparable): boolean {
   return (comp.name ?? '').toLowerCase().includes('grand theft auto vi');
 }
 
-// Fit mu_h / sigma_h from the case's comparables. caseP1 is this case's
-// hour-1 print: pool members on the same side of the pool's median
-// hour-1 as the case set the median shape, since big and small launches
-// ramp differently; the spread always uses the whole pool. Returns null
-// when the pool is too small to trust, so the caller can use the
-// embedded table.
+// Per-hour OLS slope of y on x, plus the pooled across-hour slope
+// (within-hour fixed effects: sum of the per-hour cross-products over
+// sum of the per-hour squared deviations) used when one hour has no
+// variance in x. Returns the pooled slope as well as each hour's data.
+function pooledSlope(hoursData: Map<number, { xs: number[]; ys: number[] }>): number {
+  let sxy = 0;
+  let sxx = 0;
+  for (const { xs, ys } of hoursData.values()) {
+    if (xs.length < 2) continue;
+    const mx = meanOf(xs);
+    const my = meanOf(ys);
+    for (let i = 0; i < xs.length; i++) {
+      sxy += (xs[i] - mx) * (ys[i] - my);
+      sxx += (xs[i] - mx) * (xs[i] - mx);
+    }
+  }
+  return sxx > 0 ? sxy / sxx : 0;
+}
+
+function olsSlope(xs: number[], ys: number[]): number | null {
+  if (xs.length < 2) return null;
+  const mx = meanOf(xs);
+  const my = meanOf(ys);
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    sxx += (xs[i] - mx) * (xs[i] - mx);
+    sxy += (xs[i] - mx) * (ys[i] - my);
+  }
+  return sxx > 0 ? sxy / sxx : null;
+}
+
+// Fit mu_h / sigma_h from the case's comparables by scale-conditioned
+// regression: per hour, mu_h is the OLS prediction of ln(v_h / v_1) at
+// this case's ln(p1), and sigma_h is the residual spread around the
+// fitted line. Returns null when the pool is too small to trust, so
+// the caller can use the embedded table.
 function fitShape(dayStart: string, comps: Comparable[], caseP1: number): Map<number, { mu: number; sigma: number }> | null {
-  let pool: Array<{ p1: number; hours: Map<number, number> }> = [];
+  const pool: Array<{ p1: number; hours: Map<number, number> }> = [];
   for (const comp of comps) {
     if (isGtaCategoryHistory(comp)) continue;
     if (comp.day_start === dayStart) continue; // the case's own launch day
@@ -158,30 +207,36 @@ function fitShape(dayStart: string, comps: Comparable[], caseP1: number): Map<nu
     pool.push({ p1, hours });
   }
   if (pool.length < MIN_POOL) return null;
-  const fullPool = pool;
-  if (caseP1 > 0) {
-    const mid = quantileAt(pool.map((m) => m.p1), 0.5);
-    const sameSide = pool.filter((m) => (m.p1 >= mid) === (caseP1 >= mid));
-    if (sameSide.length >= MIN_POOL) pool = sameSide;
+
+  // Per-hour regression data: x = ln(p1), y = ln(v_h / v_1).
+  const hoursData = new Map<number, { xs: number[]; ys: number[] }>();
+  for (const h of HOURS) {
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const member of pool) {
+      const v = member.hours.get(h);
+      if (v !== undefined && v > 0) {
+        xs.push(Math.log(member.p1));
+        ys.push(Math.log(v / member.p1));
+      }
+    }
+    if (xs.length >= MIN_HOUR_MEMBERS) hoursData.set(h, { xs, ys });
   }
+  if (hoursData.size === 0) return null;
+  const fallback = pooledSlope(hoursData);
+  const lnCase = Math.log(caseP1);
 
   const mu = new Map<number, number>();
   const sigma = new Map<number, number>();
-  for (const h of HOURS) {
-    const muLogs: number[] = [];
-    const sdLogs: number[] = [];
-    for (const member of pool) {
-      const v = member.hours.get(h);
-      if (v !== undefined && v > 0) muLogs.push(Math.log(v / member.p1));
-    }
-    for (const member of fullPool) {
-      const v = member.hours.get(h);
-      if (v !== undefined && v > 0) sdLogs.push(Math.log(v / member.p1));
-    }
-    if (muLogs.length >= 3) {
-      mu.set(h, quantileAt(muLogs, 0.5));
-      sigma.set(h, spreadOf(sdLogs.length >= 3 ? sdLogs : muLogs));
-    }
+  for (const [h, { xs, ys }] of hoursData) {
+    const slope = olsSlope(xs, ys) ?? fallback;
+    // Median shape at this case's scale, mean-centred.
+    mu.set(h, meanOf(ys) + slope * (lnCase - meanOf(xs)));
+    // Residual spread around the median-centred fitted line.
+    const medX = medianOf(xs);
+    const medY = medianOf(ys);
+    const resid = ys.map((y, i) => y - (medY + slope * (xs[i] - medX)));
+    sigma.set(h, spreadOf(resid));
   }
   // Fill any hour the pool skipped from its nearest fitted neighbours.
   for (const h of HOURS) {
